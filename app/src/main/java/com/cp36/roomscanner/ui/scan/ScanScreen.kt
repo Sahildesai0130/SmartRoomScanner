@@ -158,6 +158,10 @@ fun ScanScreen(viewModel: ScanViewModel, onBack: () -> Unit, onFinished: (Long) 
             config.setFocusMode(Config.FocusMode.AUTO)
             config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE)
             config.setLightEstimationMode(Config.LightEstimationMode.DISABLED)
+            // Depth API: lets ARCore measure plain, textureless walls (most ARCore phones support it).
+            if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+                config.setDepthMode(Config.DepthMode.AUTOMATIC)
+            }
             session.configure(config)
             setup = ArSetup.Ready(session)
         } catch (e: Exception) {
@@ -213,7 +217,9 @@ private fun ArScanContent(
 
     @Suppress("DEPRECATION")
     val renderer = remember(session) {
-        ArRenderer(session, { activity.windowManager.defaultDisplay.rotation }, viewModel::onFrame)
+        ArRenderer(session, { activity.windowManager.defaultDisplay.rotation }, viewModel::onFrame).apply {
+            depthEnabled = session.config.depthMode == Config.DepthMode.AUTOMATIC
+        }
     }
     val glView = remember(session) {
         GLSurfaceView(context).apply {
@@ -335,8 +341,8 @@ private fun instruction(ui: ScanUiState, frame: ArFrameInfo?, unit: LengthUnit, 
     ScanPhase.FLOOR -> "Point the camera at the floor and move the phone slowly from side to side."
     ScanPhase.CORNERS -> {
         val n = frame?.corners?.size ?: 0
-        if (n == 0) "Aim the centre pointer at the floor in a corner of the room, then tap Add corner."
-        else "Corner $n captured. Walk to the next corner (go around the room in order). When the pointer is green, tap Add corner."
+        if (n == 0) "Aim the pointer at a corner of the room – either the floor where two walls meet, or the vertical edge between the walls – then tap Add corner."
+        else "Corner $n captured. Go to the next corner (around the room in order). Aim at the floor corner or the wall edge; when the pointer is green, tap Add corner."
     }
     ScanPhase.CEILING -> {
         val h = frame?.let { vm.ceilingPreview(it) }
@@ -491,7 +497,7 @@ private fun Overlay(frame: ArFrameInfo?, ui: ScanUiState, unit: LengthUnit, vm: 
         val c = Offset(size.width / 2, size.height / 2)
         val color = when {
             ui.phase == ScanPhase.CEILING -> if (vm.ceilingPreview(info) != null) Green else Red
-            info.pointerState == PointerState.ON_FLOOR -> Green
+            info.pointerState == PointerState.ON_FLOOR || info.pointerState == PointerState.ON_WALL -> Green
             info.pointerState == PointerState.ESTIMATED -> Amber
             else -> Red
         }

@@ -5,6 +5,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import com.cp36.roomscanner.domain.model.Vec2
 import com.google.ar.core.Anchor
+import com.google.ar.core.DepthPoint
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
@@ -26,6 +27,8 @@ enum class PointerState {
     ESTIMATED,
     /** Pointer hits the detected floor plane (most accurate). */
     ON_FLOOR,
+    /** Pointer hits a wall (plane or depth); the point is dropped to floor level. */
+    ON_WALL,
 }
 
 /** Everything the UI needs from one camera frame. */
@@ -67,6 +70,10 @@ class ArRenderer(
     private var width = 1
     private var height = 1
     private var frameCount = 0
+    private var lastState = PointerState.NONE
+
+    /** Set by the scan screen when the phone supports the ARCore Depth API. */
+    @Volatile var depthEnabled = false
 
     private val view = FloatArray(16)
     private val proj = FloatArray(16)
@@ -76,8 +83,12 @@ class ArRenderer(
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
-        background.createOnGlThread()
-        session.setCameraTextureName(background.textureId)
+        try {
+            background.createOnGlThread()
+            session.setCameraTextureName(background.textureId)
+        } catch (e: Exception) {
+            reportError(e)
+        }
     }
 
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
@@ -87,7 +98,37 @@ class ArRenderer(
         viewportChanged = true
     }
 
+    /** Any error on the render thread would close the app, so it is caught and shown on screen instead. */
     override fun onDrawFrame(gl: GL10?) {
+        try {
+            drawFrame()
+        } catch (e: Exception) {
+            reportError(e)
+        }
+    }
+
+    private fun reportError(e: Exception) {
+        android.util.Log.e("ArRenderer", "AR error", e)
+        try {
+            onFrame(
+                ArFrameInfo(
+                    tracking = false,
+                    trackingMessage = "AR error: ${e.javaClass.simpleName}: ${e.message}",
+                    floorY = floorY,
+                    pointerState = PointerState.NONE,
+                    pointer = null,
+                    corners = emptyList(),
+                    viewProj = FloatArray(16),
+                    rayOrigin = Vec3(0f, 0f, 0f),
+                    rayDir = Vec3(0f, 0f, -1f),
+                    wallPointCount = 0,
+                )
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun drawFrame() {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         if (viewportChanged) {
             session.setDisplayGeometry(displayRotation(), width, height)
@@ -110,8 +151,9 @@ class ArRenderer(
         pointerPose = null
         val fy = floorY
         if (tracking && fy != null) {
-            // 1. Ray cast against detected planes (ARCore hit test).
-            for (hit in frame.hitTest(width / 2f, height / 2f)) {
+            val hits = frame.hitTest(width / 2f, height / 2f)
+            // 1. Ray cast against the detected floor plane (ARCore hit test).
+            for (hit in hits) {
                 val plane = hit.trackable as? Plane ?: continue
                 if (plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
                     plane.isPoseInPolygon(hit.hitPose) &&
@@ -120,6 +162,22 @@ class ArRenderer(
                     pointerPose = Pose.makeTranslation(hit.hitPose.tx(), fy, hit.hitPose.tz())
                     state = PointerState.ON_FLOOR
                     break
+                }
+            }
+            // 1b. Wall hit: a detected vertical plane, or a depth point (works on plain walls).
+            //     Aiming at the vertical edge where two walls meet gives the corner at any height,
+            //     so the point is dropped straight down to the floor.
+            if (pointerPose == null) {
+                for (hit in hits) {
+                    val t = hit.trackable
+                    val onWall = (t is Plane && t.type == Plane.Type.VERTICAL && t.isPoseInPolygon(hit.hitPose)) ||
+                        t is DepthPoint
+                    val y = hit.hitPose.ty()
+                    if (onWall && y > fy + 0.05f && y < fy + 3.5f && hit.distance < 8f) {
+                        pointerPose = Pose.makeTranslation(hit.hitPose.tx(), fy, hit.hitPose.tz())
+                        state = PointerState.ON_WALL
+                        break
+                    }
                 }
             }
             // 2. Fallback: intersect the ray with the infinite floor plane (y = floorY).
@@ -131,10 +189,17 @@ class ArRenderer(
                 }
             }
             if (frameCount % 6 == 0) collectWallPoints(frame, fy)
+            if (depthEnabled && frameCount % 15 == 3) collectDepthWallPoints(frame, fy)
         }
         frameCount++
 
-        val corners = anchors.map { val p = it.pose; Vec3(p.tx(), p.ty(), p.tz()) }
+        // The screen only needs ~30 updates a second; halves the work on the main thread.
+        if (frameCount % 2 == 1 && state == lastState) return
+        lastState = state
+
+        val corners = anchors.mapNotNull { a ->
+            try { val p = a.pose; Vec3(p.tx(), p.ty(), p.tz()) } catch (e: Exception) { null }
+        }
         onFrame(
             ArFrameInfo(
                 tracking = tracking,
@@ -179,6 +244,29 @@ class ArRenderer(
         return o to d
     }
 
+    /**
+     * Plain walls give ARCore few feature points. With the Depth API, a 6 × 8 grid of hit tests
+     * returns depth points on any surface; those on walls are added to the PCA wall points.
+     */
+    private fun collectDepthWallPoints(frame: com.google.ar.core.Frame, fy: Float) {
+        val found = ArrayList<Vec2>()
+        for (gx in 1..6) for (gy in 1..8) {
+            val hits = try { frame.hitTest(width * gx / 7f, height * gy / 9f) } catch (e: Exception) { continue }
+            val hit = hits.firstOrNull { it.trackable is DepthPoint } ?: continue
+            val p = hit.hitPose
+            if (p.ty() > fy + 0.3f && p.ty() < fy + 2.4f && hit.distance < 6f) {
+                found.add(Vec2(p.tx().toDouble(), p.tz().toDouble()))
+            }
+        }
+        synchronized(wallPointLock) {
+            for (v in found) {
+                if (wallPoints.size >= 40_000) break
+                val key = ((v.x / 0.03).roundToInt().toLong() shl 32) or ((v.y / 0.03).roundToInt().toLong() and 0xffffffffL)
+                if (wallPointKeys.add(key)) wallPoints.add(v)
+            }
+        }
+    }
+
     /** Keeps confident feature points between knee and ceiling height (i.e. on walls), on a 3 cm grid. */
     private fun collectWallPoints(frame: com.google.ar.core.Frame, fy: Float) {
         val cloud = try { frame.acquirePointCloud() } catch (e: Exception) { return }
@@ -221,7 +309,9 @@ class ArRenderer(
             val dx = p.tx() - pose.tx(); val dz = p.tz() - pose.tz()
             if (dx * dx + dz * dz < 0.05f * 0.05f) return false
         }
-        anchors.add(session.createAnchor(pose))
+        // createAnchor throws if tracking was lost at the moment of the tap.
+        val anchor = try { session.createAnchor(pose) } catch (e: Exception) { return false }
+        anchors.add(anchor)
         return true
     }
 
