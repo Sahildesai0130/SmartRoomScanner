@@ -153,9 +153,6 @@ class ArRenderer(
         val tracking = camera.trackingState == TrackingState.TRACKING
         if (tracking) updateFloor()
 
-        // Where to draw the floor: the detected floor, or (until it is found) ~1.3 m below the phone.
-        val drawFloorY = floorY ?: (camera.pose.ty() - 1.3f)
-
         var state = PointerState.NONE
         pointerPose = null
         // A "measured" point comes from real geometry; only these are used for corners.
@@ -216,13 +213,17 @@ class ArRenderer(
         if (addRequested) {
             addRequested = false
             samples.clear()
+            sampleHeights.clear()
             samplingFrames = 0
             sampling = true
         }
         if (sampling) {
             samplingFrames++
             val m = measured
-            if (tracking && m != null) samples.add(Vec2(m.tx().toDouble(), m.tz().toDouble()))
+            if (tracking && m != null) {
+                samples.add(Vec2(m.tx().toDouble(), m.tz().toDouble()))
+                sampleHeights.add(m.ty())
+            }
             if (samples.size >= 12 || samplingFrames > 60) {
                 sampling = false
                 onAddResult(finishCorner(m ?: pointerPose))
@@ -234,10 +235,10 @@ class ArRenderer(
         if (frameCount % 2 == 1 && state == lastState && !sampling) return
         lastState = state
 
-        // Corners are shown and measured on the floor plan, so only x and z matter;
-        // they are drawn at floor height whatever height they were captured at.
+        // Corners are drawn exactly where they were captured (on the pointer). The floor plan
+        // only uses their x and z, so the height they were captured at doesn't matter.
         val corners = anchors.mapNotNull { a ->
-            try { val p = a.pose; Vec3(p.tx(), drawFloorY, p.tz()) } catch (e: Exception) { null }
+            try { val p = a.pose; Vec3(p.tx(), p.ty(), p.tz()) } catch (e: Exception) { null }
         }
         onFrame(
             ArFrameInfo(
@@ -245,7 +246,7 @@ class ArRenderer(
                 trackingMessage = if (tracking) null else trackingMessage(camera.trackingFailureReason),
                 floorY = floorY,
                 pointerState = state,
-                pointer = pointerPose?.let { Vec3(it.tx(), drawFloorY, it.tz()) },
+                pointer = pointerPose?.let { Vec3(it.tx(), it.ty(), it.tz()) },
                 corners = corners,
                 viewProj = viewProj,
                 rayOrigin = origin,
@@ -257,6 +258,7 @@ class ArRenderer(
     }
 
     private val samples = ArrayList<Vec2>()
+    private val sampleHeights = ArrayList<Float>()
     private var samplingFrames = 0
     @Volatile private var sampling = false
 
@@ -274,7 +276,8 @@ class ArRenderer(
             if (Math.hypot(p.tx() - mx, p.tz() - mz) < 0.05) return AddResult.DUPLICATE
         }
         val anchor = try {
-            session.createAnchor(Pose.makeTranslation(mx.toFloat(), lastPose.ty(), mz.toFloat()))
+            val my = sampleHeights.sorted()[sampleHeights.size / 2]
+            session.createAnchor(Pose.makeTranslation(mx.toFloat(), my, mz.toFloat()))
         } catch (e: Exception) { return AddResult.NO_SURFACE }
         anchors.add(anchor)
         return AddResult.OK
