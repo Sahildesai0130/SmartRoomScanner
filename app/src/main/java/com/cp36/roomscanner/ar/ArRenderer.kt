@@ -34,6 +34,8 @@ enum class PointerState {
     ON_WALL,
 }
 
+enum class AddResult { OK, NO_SURFACE, UNSTEADY, DUPLICATE }
+
 /** Everything the UI needs from one camera frame. */
 class ArFrameInfo(
     val tracking: Boolean,
@@ -47,6 +49,7 @@ class ArFrameInfo(
     val rayOrigin: Vec3,
     val rayDir: Vec3,
     val wallPointCount: Int,
+    val measuring: Boolean = false,
 )
 
 /**
@@ -155,46 +158,51 @@ class ArRenderer(
 
         var state = PointerState.NONE
         pointerPose = null
-        var pointerHit: HitResult? = null
+        // A "measured" point comes from real geometry; only these are used for corners.
+        var measured: Pose? = null
         if (tracking) {
-            // Ray cast from the screen centre. Hits are sorted nearest first, so the first usable
-            // one is the surface the user is aiming at: floor, wall, wall edge or furniture.
-            // No need to wait for planes – feature points and depth points count too.
+            // Ray cast from the screen centre. Accuracy order: floor plane > wall plane >
+            // depth point > feature point. Depth/feature points are only trusted up to 4 m.
+            var best: HitResult? = null
+            var bestRank = Int.MAX_VALUE
+            var nearest = Float.MAX_VALUE
             for (hit in frame.hitTest(width / 2f, height / 2f)) {
                 val t = hit.trackable
-                val usable = when (t) {
-                    is Plane -> t.isPoseInPolygon(hit.hitPose)
-                    is DepthPoint, is Point -> true
-                    else -> false
+                val rank = when {
+                    t is Plane && t.type == Plane.Type.HORIZONTAL_UPWARD_FACING && t.isPoseInPolygon(hit.hitPose) -> 0
+                    t is Plane && t.type == Plane.Type.VERTICAL && t.isPoseInPolygon(hit.hitPose) -> 1
+                    t is DepthPoint && hit.distance < 4f -> 2
+                    t is Point && hit.distance < 4f -> 3
+                    else -> continue
                 }
-                if (!usable || hit.distance > 10f) continue
-                pointerHit = hit
-                pointerPose = hit.hitPose
-                state = if (t is Plane && t.type == Plane.Type.HORIZONTAL_UPWARD_FACING) PointerState.ON_FLOOR
-                else PointerState.ON_WALL
-                break
+                nearest = minOf(nearest, hit.distance)
+                // Don't let a plane "behind" the aimed surface win (planes can extend past walls).
+                if (rank < bestRank && hit.distance <= nearest + 0.3f) { best = hit; bestRank = rank }
             }
-            // Ray against the detected floor height, beyond the detected floor area.
+            if (best != null) {
+                measured = best.hitPose
+                pointerPose = best.hitPose
+                state = if (bestRank == 0) PointerState.ON_FLOOR else PointerState.ON_WALL
+            }
+            // Ray against the detected floor height, beyond the detected floor area (good up to ~4 m).
             val fy = floorY
-            if (pointerPose == null && fy != null && dir.y < -0.05f) {
+            if (pointerPose == null && fy != null && dir.y < -0.15f) {
                 val t = (fy - origin.y) / dir.y
-                if (t in 0f..12f) {
+                if (t in 0f..4f) {
                     pointerPose = Pose.makeTranslation(origin.x + dir.x * t, fy, origin.z + dir.z * t)
+                    measured = pointerPose
                     state = PointerState.ESTIMATED
                 }
             }
-            // Instant Placement: an immediate point at an estimated distance, refined by ARCore
-            // as soon as it understands the surface (the anchor then moves to the true position).
+            // Instant Placement: shows the pointer immediately, but is never used for a corner
+            // (its distance is a guess until ARCore has measured the surface).
             if (pointerPose == null) {
                 val hit = try {
                     frame.hitTestInstantPlacement(width / 2f, height / 2f, 2.0f).firstOrNull()
                 } catch (e: Exception) { null }
                 if (hit != null) {
-                    pointerHit = hit
                     pointerPose = hit.hitPose
-                    val ip = hit.trackable as? InstantPlacementPoint
-                    state = if (ip?.trackingMethod == InstantPlacementPoint.TrackingMethod.FULL_TRACKING)
-                        PointerState.ON_WALL else PointerState.ESTIMATED
+                    state = PointerState.ESTIMATED
                 }
             }
             if (fy != null) {
@@ -203,16 +211,27 @@ class ArRenderer(
             }
         }
 
-        // "Add corner" is done here, in the same frame as the hit test, so the anchor can be
-        // attached to the surface that was hit (it then follows ARCore's refinements).
+        // "Add corner": collect 12 measured readings (~0.4 s) and use the median, which removes
+        // most of the jitter of a single reading. Gives up after ~2 s without enough readings.
         if (addRequested) {
             addRequested = false
-            onAddResult(tracking && tryAddCorner(pointerHit, pointerPose))
+            samples.clear()
+            samplingFrames = 0
+            sampling = true
+        }
+        if (sampling) {
+            samplingFrames++
+            val m = measured
+            if (tracking && m != null) samples.add(Vec2(m.tx().toDouble(), m.tz().toDouble()))
+            if (samples.size >= 12 || samplingFrames > 60) {
+                sampling = false
+                onAddResult(finishCorner(m ?: pointerPose))
+            }
         }
         frameCount++
 
         // The screen only needs ~30 updates a second; halves the work on the main thread.
-        if (frameCount % 2 == 1 && state == lastState) return
+        if (frameCount % 2 == 1 && state == lastState && !sampling) return
         lastState = state
 
         // Corners are shown and measured on the floor plan, so only x and z matter;
@@ -232,24 +251,33 @@ class ArRenderer(
                 rayOrigin = origin,
                 rayDir = dir,
                 wallPointCount = synchronized(wallPointLock) { wallPoints.size },
+                measuring = sampling,
             )
         )
     }
 
-    private fun tryAddCorner(hit: HitResult?, pose: Pose?): Boolean {
-        if (pose == null) return false
+    private val samples = ArrayList<Vec2>()
+    private var samplingFrames = 0
+    @Volatile private var sampling = false
+
+    private fun finishCorner(lastPose: Pose?): AddResult {
+        if (samples.size < 5 || lastPose == null) return AddResult.NO_SURFACE
+        val xs = samples.map { it.x }.sorted()
+        val zs = samples.map { it.y }.sorted()
+        val mx = xs[xs.size / 2]
+        val mz = zs[zs.size / 2]
+        // Median distance of the readings from the median point: how steady the aim was.
+        val spread = samples.map { Math.hypot(it.x - mx, it.y - mz) }.sorted()[samples.size / 2]
+        if (spread > 0.04) return AddResult.UNSTEADY
         anchors.lastOrNull()?.let { last ->
             val p = last.pose
-            val dx = p.tx() - pose.tx(); val dz = p.tz() - pose.tz()
-            if (dx * dx + dz * dz < 0.05f * 0.05f) return false
+            if (Math.hypot(p.tx() - mx, p.tz() - mz) < 0.05) return AddResult.DUPLICATE
         }
         val anchor = try {
-            hit?.createAnchor() ?: session.createAnchor(pose)
-        } catch (e: Exception) {
-            try { session.createAnchor(pose) } catch (e2: Exception) { return false }
-        }
+            session.createAnchor(Pose.makeTranslation(mx.toFloat(), lastPose.ty(), mz.toFloat()))
+        } catch (e: Exception) { return AddResult.NO_SURFACE }
         anchors.add(anchor)
-        return true
+        return AddResult.OK
     }
 
     /** The floor is the lowest large upward-facing plane. */
@@ -339,8 +367,8 @@ class ArRenderer(
 
     @Volatile private var addRequested = false
 
-    /** Called with true/false after "Add corner" is processed (on the GL thread). */
-    var onAddResult: (Boolean) -> Unit = {}
+    /** Called after "Add corner" has been processed (on the GL thread). */
+    var onAddResult: (AddResult) -> Unit = {}
 
     /** Adds a corner at the pointer on the next frame. */
     fun requestAddCorner() { addRequested = true }

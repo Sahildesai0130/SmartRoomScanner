@@ -137,7 +137,7 @@ object Geometry {
         corners: List<Vec2>,
         wallPoints: List<Vec2>,
         band: Double = 0.08,
-        maxCornerShift: Double = 0.15,
+        maxCornerShift: Double = 0.10,
     ): List<Vec2> {
         val n = corners.size
         if (n < 3 || wallPoints.isEmpty()) return corners
@@ -155,7 +155,8 @@ object Geometry {
             }
             val fit = fitLineRobust(near) ?: return@List original
             val angleDiff = Math.toDegrees(abs(asinClamped(fit.dir cross u)))
-            if (angleDiff > 10.0 || original.distanceTo(fit.point) > band) original
+            // Reject loose fits (furniture, noisy depth): a real wall gives an RMS of 1–2 cm.
+            if (angleDiff > 10.0 || original.distanceTo(fit.point) > band || fit.rms > 0.025) original
             else Line2(fit.point, if ((fit.dir dot u) < 0) fit.dir * -1.0 else fit.dir, fit.rms)
         }
         return List(n) { i ->

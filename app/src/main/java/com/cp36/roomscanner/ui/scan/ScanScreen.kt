@@ -72,6 +72,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.cp36.roomscanner.ar.AddResult
 import com.cp36.roomscanner.ar.ArFrameInfo
 import com.cp36.roomscanner.ar.ArRenderer
 import com.cp36.roomscanner.ar.PointerState
@@ -221,8 +222,15 @@ private fun ArScanContent(
     val renderer = remember(session) {
         ArRenderer(session, { activity.windowManager.defaultDisplay.rotation }, viewModel::onFrame).apply {
             depthEnabled = session.config.depthMode == Config.DepthMode.AUTOMATIC
-            onAddResult = { ok ->
-                viewModel.message(if (ok) null else "Couldn't place a corner there – aim at the corner and try again")
+            onAddResult = { r ->
+                viewModel.message(
+                    when (r) {
+                        AddResult.OK -> null
+                        AddResult.NO_SURFACE -> "Couldn't measure that spot. Stand 1–2 m from the corner, aim at the floor corner and try again."
+                        AddResult.UNSTEADY -> "The pointer moved while measuring – hold the phone steady and tap again."
+                        AddResult.DUPLICATE -> "That corner is already added."
+                    }
+                )
             }
         }
     }
@@ -272,7 +280,8 @@ private fun ArScanContent(
                 Spacer(Modifier.width(8.dp))
                 InfoCard(instruction(ui, frame, settings.unit, viewModel), Modifier.weight(1f))
             }
-            val msg = cameraError ?: frame?.trackingMessage ?: ui.message
+            val msg = cameraError ?: frame?.trackingMessage
+                ?: (if (frame?.measuring == true) "Measuring… hold steady" else null) ?: ui.message
             if (msg != null) {
                 Spacer(Modifier.height(8.dp))
                 InfoCard(msg, Modifier.fillMaxWidth(), Amber.copy(alpha = 0.9f), Color.Black)
@@ -341,7 +350,7 @@ private fun instruction(ui: ScanUiState, frame: ArFrameInfo?, unit: LengthUnit, 
     ScanPhase.FLOOR -> "Point the camera at the floor and move the phone slowly from side to side."
     ScanPhase.CORNERS -> {
         val n = frame?.corners?.size ?: 0
-        if (n == 0) "Aim the pointer at a corner of the room (the floor corner or the edge where two walls meet) and tap Add corner. Green = measured surface, amber = estimate that improves as you move."
+        if (n == 0) "Stand 1–2 m from a corner, aim the pointer at the floor where the walls meet (best) or at the wall edge, and tap Add corner. Hold steady for half a second while it measures."
         else "Corner $n added. Go to the next corner around the room, aim and tap Add corner. Tap Close room after the last one."
     }
     ScanPhase.CEILING -> {
