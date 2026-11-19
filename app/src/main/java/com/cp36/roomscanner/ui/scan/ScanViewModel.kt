@@ -31,7 +31,7 @@ import kotlin.math.min
 enum class ScanPhase { FLOOR, CORNERS, CEILING, OPENINGS }
 
 data class ScanUiState(
-    val phase: ScanPhase = ScanPhase.FLOOR,
+    val phase: ScanPhase = ScanPhase.CORNERS,
     val ceilingHeight: Double? = null,
     val openings: List<Opening> = emptyList(),
     /** First edge of a door/window waiting for its second edge. */
@@ -56,9 +56,6 @@ class ScanViewModel @Inject constructor(
 
     fun onFrame(info: ArFrameInfo) {
         _frame.value = info
-        if (_ui.value.phase == ScanPhase.FLOOR && info.floorY != null) {
-            _ui.update { it.copy(phase = ScanPhase.CORNERS) }
-        }
     }
 
     fun message(text: String?) = _ui.update { it.copy(message = text) }
@@ -100,7 +97,8 @@ class ScanViewModel @Inject constructor(
     fun captureCeiling() {
         val info = _frame.value ?: return
         val h = ceilingPreview(info)
-        if (h == null) message("Aim at the ceiling straight above one of the corners")
+        if (info.floorY == null) message("Floor not detected yet – tap \"Type height\" to enter the ceiling height")
+        else if (h == null) message("Aim at the ceiling straight above one of the corners")
         else _ui.update { it.copy(ceilingHeight = h, phase = ScanPhase.OPENINGS, message = null) }
     }
 

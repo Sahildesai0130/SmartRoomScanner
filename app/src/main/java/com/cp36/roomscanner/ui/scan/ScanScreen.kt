@@ -158,6 +158,8 @@ fun ScanScreen(viewModel: ScanViewModel, onBack: () -> Unit, onFinished: (Long) 
             config.setFocusMode(Config.FocusMode.AUTO)
             config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE)
             config.setLightEstimationMode(Config.LightEstimationMode.DISABLED)
+            // Instant Placement: points can be placed immediately, before surfaces are detected.
+            config.setInstantPlacementMode(Config.InstantPlacementMode.LOCAL_Y_UP)
             // Depth API: lets ARCore measure plain, textureless walls (most ARCore phones support it).
             if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
                 config.setDepthMode(Config.DepthMode.AUTOMATIC)
@@ -219,6 +221,9 @@ private fun ArScanContent(
     val renderer = remember(session) {
         ArRenderer(session, { activity.windowManager.defaultDisplay.rotation }, viewModel::onFrame).apply {
             depthEnabled = session.config.depthMode == Config.DepthMode.AUTOMATIC
+            onAddResult = { ok ->
+                viewModel.message(if (ok) null else "Couldn't place a corner there – aim at the corner and try again")
+            }
         }
     }
     val glView = remember(session) {
@@ -288,14 +293,9 @@ private fun ArScanContent(
                     )
                     ScanPhase.CORNERS -> CornerControls(
                         cornerCount = frame?.corners?.size ?: 0,
-                        canAdd = frame?.pointerState != PointerState.NONE,
+                        canAdd = frame?.tracking == true,
                         onUndo = { glView.queueEvent { renderer.removeLastCorner() } },
-                        onAdd = {
-                            glView.queueEvent {
-                                if (!renderer.addCorner()) viewModel.message("Aim at the floor where the walls meet")
-                                else viewModel.message(null)
-                            }
-                        },
+                        onAdd = { renderer.requestAddCorner() },
                         onClose = viewModel::closeRoom,
                     )
                     ScanPhase.CEILING -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -341,8 +341,8 @@ private fun instruction(ui: ScanUiState, frame: ArFrameInfo?, unit: LengthUnit, 
     ScanPhase.FLOOR -> "Point the camera at the floor and move the phone slowly from side to side."
     ScanPhase.CORNERS -> {
         val n = frame?.corners?.size ?: 0
-        if (n == 0) "Aim the pointer at a corner of the room – either the floor where two walls meet, or the vertical edge between the walls – then tap Add corner."
-        else "Corner $n captured. Go to the next corner (around the room in order). Aim at the floor corner or the wall edge; when the pointer is green, tap Add corner."
+        if (n == 0) "Aim the pointer at a corner of the room (the floor corner or the edge where two walls meet) and tap Add corner. Green = measured surface, amber = estimate that improves as you move."
+        else "Corner $n added. Go to the next corner around the room, aim and tap Add corner. Tap Close room after the last one."
     }
     ScanPhase.CEILING -> {
         val h = frame?.let { vm.ceilingPreview(it) }
