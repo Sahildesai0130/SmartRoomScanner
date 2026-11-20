@@ -71,6 +71,7 @@ class ArRenderer(
     private val background = BackgroundRenderer()
     private val anchors = ArrayList<Anchor>()
     private var floorY: Float? = null
+    private var floorFromPlane = false
     private var pointerPose: Pose? = null
     private var viewportChanged = false
     private var width = 1
@@ -158,42 +159,53 @@ class ArRenderer(
         // A "measured" point comes from real geometry; only these are used for corners.
         var measured: Pose? = null
         if (tracking) {
-            // Ray cast from the screen centre. Accuracy order: floor plane > wall plane >
-            // depth point > feature point. Depth/feature points are only trusted up to 4 m.
-            var best: HitResult? = null
-            var bestRank = Int.MAX_VALUE
-            var nearest = Float.MAX_VALUE
-            for (hit in frame.hitTest(width / 2f, height / 2f)) {
+            val hits = frame.hitTest(width / 2f, height / 2f)
+
+            // Quick floor estimate before ARCore has found the floor plane: while the phone looks
+            // down, the surface under the pointer (depth or feature point) is the floor.
+            if (floorY == null && dir.y < -0.6f) {
+                hits.firstOrNull { (it.trackable is DepthPoint || it.trackable is Point) && it.distance < 3f }
+                    ?.let { floorY = it.hitPose.ty(); floorFromPlane = false }
+            }
+
+            // Nearest real surface under the pointer (any plane, depth point or feature point).
+            var surface: HitResult? = null
+            for (hit in hits) {
                 val t = hit.trackable
-                val rank = when {
-                    t is Plane && t.type == Plane.Type.HORIZONTAL_UPWARD_FACING && t.isPoseInPolygon(hit.hitPose) -> 0
-                    t is Plane && t.type == Plane.Type.VERTICAL && t.isPoseInPolygon(hit.hitPose) -> 1
-                    t is DepthPoint && hit.distance < 4f -> 2
-                    t is Point && hit.distance < 4f -> 3
-                    else -> continue
+                val ok = when (t) {
+                    is Plane -> t.isPoseInPolygon(hit.hitPose)
+                    is DepthPoint, is Point -> hit.distance < 5f
+                    else -> false
                 }
-                nearest = minOf(nearest, hit.distance)
-                // Don't let a plane "behind" the aimed surface win (planes can extend past walls).
-                if (rank < bestRank && hit.distance <= nearest + 0.3f) { best = hit; bestRank = rank }
+                if (ok) { surface = hit; break }
             }
-            if (best != null) {
-                measured = best.hitPose
-                pointerPose = best.hitPose
-                state = if (bestRank == 0) PointerState.ON_FLOOR else PointerState.ON_WALL
-            }
-            // Ray against the detected floor height, beyond the detected floor area (good up to ~4 m).
+
+            // Main method – works on any wall, even plain ones: intersect the pointer ray with the
+            // floor. Aim at the line where the wall meets the floor and this gives the corner.
             val fy = floorY
-            if (pointerPose == null && fy != null && dir.y < -0.15f) {
+            var floorPoint: Pose? = null
+            if (fy != null && dir.y < -0.05f) {
                 val t = (fy - origin.y) / dir.y
-                if (t in 0f..4f) {
-                    pointerPose = Pose.makeTranslation(origin.x + dir.x * t, fy, origin.z + dir.z * t)
-                    measured = pointerPose
-                    state = PointerState.ESTIMATED
-                }
+                if (t in 0f..8f) floorPoint = Pose.makeTranslation(origin.x + dir.x * t, fy, origin.z + dir.z * t)
             }
-            // Instant Placement: shows the pointer immediately, but is never used for a corner
-            // (its distance is a guess until ARCore has measured the surface).
-            if (pointerPose == null) {
+            val surfaceDist = surface?.distance ?: Float.MAX_VALUE
+            val floorDist = floorPoint?.let {
+                val dx = it.tx() - origin.x; val dy = it.ty() - origin.y; val dz = it.tz() - origin.z
+                kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+            } ?: Float.MAX_VALUE
+
+            if (floorPoint != null && floorDist <= surfaceDist + 0.3f) {
+                // The floor is what the pointer is on (nothing nearer in the way).
+                pointerPose = floorPoint
+                measured = floorPoint
+                state = PointerState.ON_FLOOR
+            } else if (surface != null) {
+                // Something nearer than the floor: a wall, wall edge or furniture.
+                pointerPose = surface.hitPose
+                measured = surface.hitPose
+                state = PointerState.ON_WALL
+            } else {
+                // Nothing measured yet: show an Instant Placement preview so the pointer still moves.
                 val hit = try {
                     frame.hitTestInstantPlacement(width / 2f, height / 2f, 2.0f).firstOrNull()
                 } catch (e: Exception) { null }
@@ -291,7 +303,11 @@ class ArRenderer(
             if (plane.extentX * plane.extentZ < 0.25f) continue
             val y = plane.centerPose.ty()
             val current = floorY
-            if (current == null || y < current - 0.05f) floorY = y
+            // A detected floor plane replaces the quick estimate; afterwards keep the lowest plane.
+            if (current == null || !floorFromPlane || y < current - 0.05f) {
+                floorY = y
+                floorFromPlane = true
+            }
         }
     }
 

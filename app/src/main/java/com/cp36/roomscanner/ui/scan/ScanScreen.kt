@@ -226,7 +226,7 @@ private fun ArScanContent(
                 viewModel.message(
                     when (r) {
                         AddResult.OK -> null
-                        AddResult.NO_SURFACE -> "Couldn't measure that spot. Stand 1–2 m from the corner, aim at the floor corner and try again."
+                        AddResult.NO_SURFACE -> "Couldn't measure that spot. Point at the floor first, then aim at the bottom of the corner and try again."
                         AddResult.UNSTEADY -> "The pointer moved while measuring – hold the phone steady and tap again."
                         AddResult.DUPLICATE -> "That corner is already added."
                     }
@@ -350,7 +350,8 @@ private fun instruction(ui: ScanUiState, frame: ArFrameInfo?, unit: LengthUnit, 
     ScanPhase.FLOOR -> "Point the camera at the floor and move the phone slowly from side to side."
     ScanPhase.CORNERS -> {
         val n = frame?.corners?.size ?: 0
-        if (n == 0) "Stand 1–2 m from a corner, aim the pointer at the floor where the walls meet (best) or at the wall edge, and tap Add corner. Hold steady for half a second while it measures."
+        if (frame?.floorY == null) "First point the phone down at the floor for a second so it can find the floor."
+        else if (n == 0) "Aim the pointer at the floor right where two walls meet (the bottom of the corner) and tap Add corner. Hold steady while it measures."
         else "Corner $n added. Go to the next corner around the room, aim and tap Add corner. Tap Close room after the last one."
     }
     ScanPhase.CEILING -> {
