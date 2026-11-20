@@ -150,6 +150,7 @@ class ArRenderer(
         val viewProj = FloatArray(16)
         Matrix.multiplyMM(viewProj, 0, proj, 0, view, 0)
         val (origin, dir) = centreRay(viewProj)
+        val rayOk = listOf(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z).all { it.isFinite() }
 
         val tracking = camera.trackingState == TrackingState.TRACKING
         if (tracking) updateFloor()
@@ -158,14 +159,14 @@ class ArRenderer(
         pointerPose = null
         // A "measured" point comes from real geometry; only these are used for corners.
         var measured: Pose? = null
-        if (tracking) {
-            val hits = frame.hitTest(width / 2f, height / 2f)
+        if (tracking && rayOk) {
+            val hits = frame.hitTest(width / 2f, height / 2f).filter { finite(it.hitPose) }
 
             // Quick floor estimate before ARCore has found the floor plane: while the phone looks
             // down, the surface under the pointer (depth or feature point) is the floor.
             if (floorY == null && dir.y < -0.6f) {
                 hits.firstOrNull { (it.trackable is DepthPoint || it.trackable is Point) && it.distance < 3f }
-                    ?.let { floorY = it.hitPose.ty(); floorFromPlane = false }
+                    ?.let { if (it.hitPose.ty().isFinite()) { floorY = it.hitPose.ty(); floorFromPlane = false } }
             }
 
             // Nearest real surface under the pointer (any plane, depth point or feature point).
@@ -186,7 +187,7 @@ class ArRenderer(
             var floorPoint: Pose? = null
             if (fy != null && dir.y < -0.05f) {
                 val t = (fy - origin.y) / dir.y
-                if (t in 0f..8f) floorPoint = Pose.makeTranslation(origin.x + dir.x * t, fy, origin.z + dir.z * t)
+                if (t.isFinite() && t in 0f..8f) floorPoint = Pose.makeTranslation(origin.x + dir.x * t, fy, origin.z + dir.z * t)
             }
             val surfaceDist = surface?.distance ?: Float.MAX_VALUE
             val floorDist = floorPoint?.let {
@@ -232,7 +233,7 @@ class ArRenderer(
         if (sampling) {
             samplingFrames++
             val m = measured
-            if (tracking && m != null) {
+            if (tracking && m != null && finite(m)) {
                 samples.add(Vec2(m.tx().toDouble(), m.tz().toDouble()))
                 sampleHeights.add(m.ty())
             }
@@ -250,7 +251,7 @@ class ArRenderer(
         // Corners are drawn exactly where they were captured (on the pointer). The floor plan
         // only uses their x and z, so the height they were captured at doesn't matter.
         val corners = anchors.mapNotNull { a ->
-            try { val p = a.pose; Vec3(p.tx(), p.ty(), p.tz()) } catch (e: Exception) { null }
+            try { val p = a.pose; if (finite(p)) Vec3(p.tx(), p.ty(), p.tz()) else null } catch (e: Exception) { null }
         }
         onFrame(
             ArFrameInfo(
@@ -258,7 +259,7 @@ class ArRenderer(
                 trackingMessage = if (tracking) null else trackingMessage(camera.trackingFailureReason),
                 floorY = floorY,
                 pointerState = state,
-                pointer = pointerPose?.let { Vec3(it.tx(), it.ty(), it.tz()) },
+                pointer = pointerPose?.takeIf { finite(it) }?.let { Vec3(it.tx(), it.ty(), it.tz()) },
                 corners = corners,
                 viewProj = viewProj,
                 rayOrigin = origin,
@@ -268,6 +269,8 @@ class ArRenderer(
             )
         )
     }
+
+    private fun finite(p: Pose) = p.tx().isFinite() && p.ty().isFinite() && p.tz().isFinite()
 
     private val samples = ArrayList<Vec2>()
     private val sampleHeights = ArrayList<Float>()
@@ -302,6 +305,7 @@ class ArRenderer(
             if (plane.type != Plane.Type.HORIZONTAL_UPWARD_FACING) continue
             if (plane.extentX * plane.extentZ < 0.25f) continue
             val y = plane.centerPose.ty()
+            if (!y.isFinite()) continue
             val current = floorY
             // A detected floor plane replaces the quick estimate; afterwards keep the lowest plane.
             if (current == null || !floorFromPlane || y < current - 0.05f) {
@@ -337,13 +341,14 @@ class ArRenderer(
             val hits = try { frame.hitTest(width * gx / 7f, height * gy / 9f) } catch (e: Exception) { continue }
             val hit = hits.firstOrNull { it.trackable is DepthPoint } ?: continue
             val p = hit.hitPose
-            if (p.ty() > fy + 0.3f && p.ty() < fy + 2.4f && hit.distance < 6f) {
+            if (finite(p) && p.ty() > fy + 0.3f && p.ty() < fy + 2.4f && hit.distance < 6f) {
                 found.add(Vec2(p.tx().toDouble(), p.tz().toDouble()))
             }
         }
         synchronized(wallPointLock) {
             for (v in found) {
                 if (wallPoints.size >= 40_000) break
+                if (!v.x.isFinite() || !v.y.isFinite()) continue
                 val key = ((v.x / 0.03).roundToInt().toLong() shl 32) or ((v.y / 0.03).roundToInt().toLong() and 0xffffffffL)
                 if (wallPointKeys.add(key)) wallPoints.add(v)
             }
@@ -362,6 +367,7 @@ class ArRenderer(
                     val y = buf.get(i * 4 + 1)
                     val z = buf.get(i * 4 + 2)
                     val conf = buf.get(i * 4 + 3)
+                    if (!x.isFinite() || !y.isFinite() || !z.isFinite()) continue
                     if (conf < 0.3f || y < fy + 0.3f || y > fy + 2.4f) continue
                     if (wallPoints.size >= 40_000) break
                     val key = ((x / 0.03f).roundToInt().toLong() shl 32) or
